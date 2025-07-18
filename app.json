@@ -1,11 +1,11 @@
 {
   "expo": {
-    "name": "crypto-trading-app",
-    "slug": "crypto-trading-app",
+    "name": "Crypto Trading Details Screen Clone",
+    "slug": "crypto-trading-details-screen-q342uwif",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "cryptotradingapp",
+    "scheme": "myapp",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "splash": {
@@ -14,22 +14,23 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "app.crypto-trading-details-screen-q342uwif"
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "edgeToEdgeEnabled": true
+      "package": "app.crypto-trading-details-screen-q342uwif"
     },
     "web": {
-      "bundler": "metro",
-      "output": "static",
       "favicon": "./assets/images/favicon.png"
     },
     "plugins": [
-      "expo-router"
+      [
+        "expo-router"
+      ]
     ],
     "experiments": {
       "typedRoutes": true
