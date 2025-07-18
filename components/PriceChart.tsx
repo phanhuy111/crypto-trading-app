@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo } from "react";
 import { View, StyleSheet, Dimensions, Text, Pressable } from "react-native";
 import Svg, {
   Line,
@@ -8,10 +8,21 @@ import Svg, {
   ClipPath,
   Rect,
 } from "react-native-svg";
+import Animated, {
+  useSharedValue,
+  useAnimatedStyle,
+  useAnimatedGestureHandler,
+  runOnJS,
+  withSpring,
+  interpolate,
+  Extrapolate,
+} from "react-native-reanimated";
 import {
   PanGestureHandler,
   PinchGestureHandler,
   State,
+  PinchGestureHandlerGestureEvent,
+  PanGestureHandlerGestureEvent,
 } from "react-native-gesture-handler";
 import { useChartData } from "@/hooks/useTradingStore";
 import { TimeRange } from "@/types/trading";
@@ -27,84 +38,77 @@ const CHART_PADDING_LEFT = 80;
 const CHART_PADDING_RIGHT = 20;
 const TIME_RANGES: TimeRange[] = ["7D", "1M", "3M", "1Y", "5Y", "MAX"];
 
+// Constants for better performance
+const MIN_SCALE = 0.5;
+const MAX_SCALE = 5;
+const SCALE_STEP = 0.2;
+
+// Context types for gesture handlers
+interface PinchContext extends Record<string, unknown> {
+  startScale: number;
+}
+
+interface PanContext extends Record<string, unknown> {
+  startTranslateX: number;
+}
+
 export default function PriceChart() {
   const { data: chartData, isLoading } = useChartData();
   const { selectedTimeRange, changeTimeRange } = useTradingStore();
 
-  // Interactive state
-  const [scale, setScale] = useState(1);
-  const [translateX, setTranslateX] = useState(0);
-  const [lastScale, setLastScale] = useState(1);
-  const [lastTranslateX, setLastTranslateX] = useState(0);
+  // Shared values for smooth animations
+  const scale = useSharedValue(1);
+  const translateX = useSharedValue(0);
+  const focalX = useSharedValue(0);
+  const focalY = useSharedValue(0);
 
-  const panRef = useRef<PanGestureHandler>(null);
-  const pinchRef = useRef<PinchGestureHandler>(null);
+  // Chart dimensions
+  const chartWidth = SCREEN_WIDTH - CHART_PADDING_LEFT - CHART_PADDING_RIGHT;
+  const chartHeight = CHART_HEIGHT - CHART_PADDING_TOP - CHART_PADDING_BOTTOM;
 
-  // Reset interactive state when data changes
+  // Reset values when data changes
   useEffect(() => {
-    setScale(1);
-    setTranslateX(0);
-    setLastScale(1);
-    setLastTranslateX(0);
+    scale.value = withSpring(1);
+    translateX.value = withSpring(0);
+    focalX.value = 0;
+    focalY.value = 0;
   }, [chartData, selectedTimeRange]);
 
-  // Handle pinch gesture for zoom
-  const onPinchGestureEvent = (event: any) => {
-    const newScale = Math.max(
-      0.5,
-      Math.min(5, lastScale * event.nativeEvent.scale)
-    );
-    setScale(newScale);
-  };
-
-  const onPinchHandlerStateChange = (event: any) => {
-    if (event.nativeEvent.oldState === State.ACTIVE) {
-      setLastScale(scale);
+  // Memoized chart calculations for better performance
+  const chartCalculations = useMemo(() => {
+    if (!chartData || chartData.prices.length === 0) {
+      return {
+        path: "",
+        gridLines: [],
+        minPrice: 0,
+        maxPrice: 0,
+        priceRange: 0,
+        points: [],
+      };
     }
-  };
-
-  // Handle pan gesture for horizontal scrolling
-  const onPanGestureEvent = (event: any) => {
-    if (!chartData) return;
-
-    const chartWidth = SCREEN_WIDTH - CHART_PADDING_LEFT - CHART_PADDING_RIGHT;
-    const scaledWidth = chartWidth * scale;
-
-    // Calculate max translation to prevent chart from going beyond boundaries
-    const maxTranslate = Math.max(0, (scaledWidth - chartWidth) / 2);
-
-    // Constrain translation to keep chart within bounds
-    const newTranslateX = Math.max(
-      -maxTranslate,
-      Math.min(maxTranslate, lastTranslateX + event.nativeEvent.translationX)
-    );
-    setTranslateX(newTranslateX);
-  };
-
-  const onPanHandlerStateChange = (event: any) => {
-    if (event.nativeEvent.oldState === State.ACTIVE) {
-      setLastTranslateX(translateX);
-    }
-  };
-
-  // Create the chart path with interactive transformations
-  const createPath = () => {
-    if (!chartData || chartData.prices.length === 0) return "";
 
     const prices = chartData.prices.map((p) => p.price);
     const minPrice = Math.min(...prices);
     const maxPrice = Math.max(...prices);
-    const priceRange = maxPrice - minPrice;
+    const priceRange = maxPrice - minPrice || 1; // Prevent division by zero
 
-    const chartWidth = SCREEN_WIDTH - CHART_PADDING_LEFT - CHART_PADDING_RIGHT;
-    const chartHeight = CHART_HEIGHT - CHART_PADDING_TOP - CHART_PADDING_BOTTOM;
-    const xScale = chartWidth / (chartData.prices.length - 1);
-    const yScale = chartHeight / (priceRange || 1);
+    // Add some padding to the price range for better visualization
+    const paddedRange = priceRange * 1.1;
+    const paddedMin = minPrice - (paddedRange - priceRange) / 2;
+    const paddedMax = maxPrice + (paddedRange - priceRange) / 2;
 
+    const xScale = chartWidth / Math.max(1, chartData.prices.length - 1);
+    const yScale = chartHeight / paddedRange;
+
+    // Create path and store points for reference
     let path = "";
+    const points: Array<{ x: number; y: number; price: number }> = [];
+    
     chartData.prices.forEach((point, i) => {
       const x = i * xScale;
-      const y = (maxPrice - point.price) * yScale;
+      const y = ((paddedMax - point.price) / paddedRange) * chartHeight;
+
+      points.push({ x, y, price: point.price });
 
       if (i === 0) {
         path += `M ${x} ${y}`;
@@ -113,38 +117,120 @@ export default function PriceChart() {
       }
     });
 
-    return path;
-  };
-
-  // Create horizontal grid lines
-  const createGridLines = () => {
-    if (!chartData) return [];
-
-    const prices = chartData.prices.map((p) => p.price);
-    const minPrice = Math.min(...prices);
-    const maxPrice = Math.max(...prices);
-    const priceRange = maxPrice - minPrice;
-
-    const lines = [];
-    for (let i = 0; i <= 5; i++) {
-      const price = minPrice + (priceRange * i) / 5;
-      const chartHeight =
-        CHART_HEIGHT - CHART_PADDING_TOP - CHART_PADDING_BOTTOM;
-      const y =
-        CHART_PADDING_TOP + ((maxPrice - price) / priceRange) * chartHeight;
-
-      lines.push({
-        y,
-        price,
-      });
+    // Create grid lines with better spacing
+    const gridLines = [];
+    const gridCount = 6;
+    for (let i = 0; i <= gridCount; i++) {
+      const price = paddedMin + (paddedRange * i) / gridCount;
+      const y = CHART_PADDING_TOP + (i / gridCount) * chartHeight;
+      gridLines.push({ y, price });
     }
 
-    return lines;
-  };
+    return { 
+      path, 
+      gridLines, 
+      minPrice: paddedMin, 
+      maxPrice: paddedMax, 
+      priceRange: paddedRange,
+      points 
+    };
+  }, [chartData, chartWidth, chartHeight]);
+
+  // Pinch gesture handler for zoom
+  const pinchGestureHandler = useAnimatedGestureHandler<
+    PinchGestureHandlerGestureEvent,
+    PinchContext
+  >({
+    onStart: (event, context) => {
+      context.startScale = scale.value;
+      focalX.value = event.focalX;
+      focalY.value = event.focalY;
+    },
+    onActive: (event, context) => {
+      const newScale = Math.max(
+        MIN_SCALE,
+        Math.min(MAX_SCALE, context.startScale * event.scale)
+      );
+      scale.value = newScale;
+    },
+    onEnd: () => {
+      // Smooth spring animation when gesture ends
+      scale.value = withSpring(scale.value);
+    },
+  });
+
+  // Pan gesture handler for horizontal scrolling
+  const panGestureHandler = useAnimatedGestureHandler<
+    PanGestureHandlerGestureEvent,
+    PanContext
+  >({
+    onStart: (event, context) => {
+      context.startTranslateX = translateX.value;
+    },
+    onActive: (event, context) => {
+      const scaledWidth = chartWidth * scale.value;
+      const maxTranslate = Math.max(0, (scaledWidth - chartWidth) / 2);
+
+      const newTranslateX = Math.max(
+        -maxTranslate,
+        Math.min(maxTranslate, context.startTranslateX + event.translationX)
+      );
+      translateX.value = newTranslateX;
+    },
+    onEnd: () => {
+      // Smooth spring animation when gesture ends
+      translateX.value = withSpring(translateX.value);
+    },
+  });
+
+  // Animated style for the chart container
+  const animatedChartStyle = useAnimatedStyle(() => {
+    return {
+      transform: [{ translateX: translateX.value }, { scale: scale.value }],
+    };
+  });
+
+  // Animated style for zoom indicator
+  const animatedZoomStyle = useAnimatedStyle(() => {
+    const opacity = interpolate(
+      scale.value,
+      [1, 2],
+      [0.7, 1],
+      Extrapolate.CLAMP
+    );
+
+    return {
+      opacity,
+      transform: [
+        {
+          scale: withSpring(scale.value > 1 ? 1.1 : 1),
+        },
+      ],
+    };
+  });
 
   // Handle time range selection
   const handleTimeRangeSelect = (range: TimeRange) => {
     changeTimeRange(range);
+  };
+
+  // Handle zoom controls
+  const handleZoomIn = () => {
+    "worklet";
+    const newScale = Math.min(MAX_SCALE, scale.value + SCALE_STEP);
+    scale.value = withSpring(newScale);
+  };
+
+  const handleZoomOut = () => {
+    "worklet";
+    const newScale = Math.max(MIN_SCALE, scale.value - SCALE_STEP);
+    scale.value = withSpring(newScale);
+  };
+
+  const handleResetZoom = () => {
+    "worklet";
+    scale.value = withSpring(1);
+    translateX.value = withSpring(0);
   };
 
   // Render the time range selector
@@ -174,44 +260,12 @@ export default function PriceChart() {
     );
   };
 
-  // Render the last point on the chart
-  const renderLastPoint = () => {
-    if (!chartData || chartData.prices.length === 0) return null;
-
-    const prices = chartData.prices.map((p) => p.price);
-    const minPrice = Math.min(...prices);
-    const maxPrice = Math.max(...prices);
-    const priceRange = maxPrice - minPrice;
-
-    const chartWidth = SCREEN_WIDTH - CHART_PADDING_LEFT - CHART_PADDING_RIGHT;
-    const chartHeight = CHART_HEIGHT - CHART_PADDING_TOP - CHART_PADDING_BOTTOM;
-    const xScale = chartWidth / (chartData.prices.length - 1);
-    const yScale = chartHeight / (priceRange || 1);
-
-    const lastPoint = chartData.prices[chartData.prices.length - 1];
-    const x = (chartData.prices.length - 1) * xScale;
-    const y = (maxPrice - lastPoint.price) * yScale;
-
-    return (
-      <Circle
-        cx={x}
-        cy={y}
-        r={4}
-        fill={Colors.chart.line}
-        stroke={Colors.background.primary}
-        strokeWidth={2}
-      />
-    );
-  };
-
   // Render grid lines with price labels
   const renderGridLines = () => {
-    const gridLines = createGridLines();
-
     return (
       <View style={styles.gridContainer}>
         <Svg height={CHART_HEIGHT} width={SCREEN_WIDTH} style={styles.gridSvg}>
-          {gridLines.map((line, index) => (
+          {chartCalculations.gridLines.map((line, index) => (
             <Line
               key={index}
               x1={CHART_PADDING_LEFT}
@@ -224,7 +278,7 @@ export default function PriceChart() {
             />
           ))}
         </Svg>
-        {gridLines.map((line, index) => (
+        {chartCalculations.gridLines.map((line, index) => (
           <Text
             key={`label-${index}`}
             style={[styles.gridLineText, { top: line.y - 8 }]}
@@ -236,32 +290,49 @@ export default function PriceChart() {
     );
   };
 
-  // Render zoom controls
+  // Render zoom controls with animations
   const renderZoomControls = () => {
     return (
-      <View style={styles.zoomControls}>
+      <Animated.View style={[styles.zoomControls, animatedZoomStyle]}>
         <Pressable
           style={styles.zoomButton}
-          onPress={() => {
-            const newScale = Math.max(0.5, scale - 0.2);
-            setScale(newScale);
-            setLastScale(newScale);
-          }}
+          onPress={() => runOnJS(handleZoomOut)()}
         >
           <Text style={styles.zoomButtonText}>-</Text>
         </Pressable>
-        <Text style={styles.zoomText}>{scale.toFixed(1)}x</Text>
+
+        <Pressable
+          style={styles.resetButton}
+          onPress={() => runOnJS(handleResetZoom)()}
+        >
+          <Text style={styles.resetButtonText}>Reset</Text>
+        </Pressable>
+
         <Pressable
           style={styles.zoomButton}
-          onPress={() => {
-            const newScale = Math.min(5, scale + 0.2);
-            setScale(newScale);
-            setLastScale(newScale);
-          }}
+          onPress={() => runOnJS(handleZoomIn)()}
         >
           <Text style={styles.zoomButtonText}>+</Text>
         </Pressable>
-      </View>
+      </Animated.View>
+    );
+  };
+
+  // Render last point with animation
+  const renderLastPoint = () => {
+    if (!chartData || chartData.prices.length === 0 || !chartCalculations.points.length) return null;
+
+    const lastPoint = chartCalculations.points[chartCalculations.points.length - 1];
+
+    return (
+      <Circle
+        cx={lastPoint.x}
+        cy={lastPoint.y}
+        r={4}
+        fill={Colors.chart.line}
+        stroke={Colors.background.primary}
+        strokeWidth={2}
+      />
     );
   };
 
@@ -273,81 +344,73 @@ export default function PriceChart() {
     );
   }
 
-  const chartWidth = SCREEN_WIDTH - CHART_PADDING_LEFT - CHART_PADDING_RIGHT;
-  const chartHeight = CHART_HEIGHT - CHART_PADDING_TOP - CHART_PADDING_BOTTOM;
-
   return (
     <View style={styles.container}>
       <View style={styles.chartContainer}>
         {renderGridLines()}
+
         <View style={[styles.interactiveArea, { left: CHART_PADDING_LEFT }]}>
-          <PinchGestureHandler
-            ref={pinchRef}
-            onGestureEvent={onPinchGestureEvent}
-            onHandlerStateChange={onPinchHandlerStateChange}
-            simultaneousHandlers={panRef}
-          >
-            <PanGestureHandler
-              ref={panRef}
-              onGestureEvent={onPanGestureEvent}
-              onHandlerStateChange={onPanHandlerStateChange}
-              simultaneousHandlers={pinchRef}
-              minPointers={1}
-              maxPointers={1}
-            >
-              <View style={styles.svgContainer}>
-                <Svg
-                  height={CHART_HEIGHT}
-                  width={chartWidth}
-                  style={styles.chartSvg}
-                >
-                  <Defs>
-                    <ClipPath id="chartClip">
-                      <Rect
-                        x={0}
-                        y={CHART_PADDING_TOP}
-                        width={chartWidth}
-                        height={chartHeight}
+          <PinchGestureHandler onGestureEvent={pinchGestureHandler}>
+            <Animated.View style={styles.gestureContainer}>
+              <PanGestureHandler
+                onGestureEvent={panGestureHandler}
+                minPointers={1}
+                maxPointers={1}
+              >
+                <Animated.View style={styles.svgContainer}>
+                  <Animated.View style={animatedChartStyle}>
+                    <Svg
+                      height={CHART_HEIGHT}
+                      width={chartWidth}
+                      style={styles.chartSvg}
+                    >
+                      <Defs>
+                        <ClipPath id="chartClip">
+                          <Rect
+                            x={0}
+                            y={CHART_PADDING_TOP}
+                            width={chartWidth}
+                            height={chartHeight}
+                          />
+                        </ClipPath>
+                        <linearGradient id="chartGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                          <stop offset="0%" stopColor={Colors.chart.line} stopOpacity="0.3" />
+                          <stop offset="100%" stopColor={Colors.chart.line} stopOpacity="0.05" />
+                        </linearGradient>
+                      </Defs>
+
+                      {/* Chart area fill */}
+                      {chartCalculations.path && (
+                        <Path
+                          d={`${chartCalculations.path} L ${chartWidth} ${chartHeight} L 0 ${chartHeight} Z`}
+                          fill="url(#chartGradient)"
+                          clipPath="url(#chartClip)"
+                          transform={`translate(0, ${CHART_PADDING_TOP})`}
+                        />
+                      )}
+
+                      {/* Chart path */}
+                      <Path
+                        d={chartCalculations.path}
+                        stroke={Colors.chart.line}
+                        strokeWidth={2}
+                        fill="none"
+                        clipPath="url(#chartClip)"
+                        transform={`translate(0, ${CHART_PADDING_TOP})`}
                       />
-                    </ClipPath>
-                  </Defs>
 
-                  {/* Chart path with scaling and translation */}
-                  <Path
-                    d={createPath()}
-                    stroke={Colors.chart.line}
-                    strokeWidth={2}
-                    fill="none"
-                    clipPath="url(#chartClip)"
-                    transform={`translate(${translateX}, ${CHART_PADDING_TOP}) scale(${scale}, 1)`}
-                  />
-
-                  {/* Last point with scaling and translation */}
-                  <Circle
-                    cx={
-                      (chartData.prices.length - 1) *
-                      (chartWidth / (chartData.prices.length - 1))
-                    }
-                    cy={
-                      CHART_PADDING_TOP +
-                      ((Math.max(...chartData.prices.map((p) => p.price)) -
-                        chartData.prices[chartData.prices.length - 1].price) /
-                        (Math.max(...chartData.prices.map((p) => p.price)) -
-                          Math.min(...chartData.prices.map((p) => p.price)))) *
-                        chartHeight
-                    }
-                    r={4}
-                    fill={Colors.chart.line}
-                    stroke={Colors.background.primary}
-                    strokeWidth={2}
-                    clipPath="url(#chartClip)"
-                    transform={`translate(${translateX}, 0) scale(${scale}, 1)`}
-                  />
-                </Svg>
-              </View>
-            </PanGestureHandler>
+                      {/* Last point */}
+                      <g transform={`translate(0, ${CHART_PADDING_TOP})`}>
+                        {renderLastPoint()}
+                      </g>
+                    </Svg>
+                  </Animated.View>
+                </Animated.View>
+              </PanGestureHandler>
+            </Animated.View>
           </PinchGestureHandler>
         </View>
+
         {renderZoomControls()}
       </View>
       {renderTimeRangeSelector()}
@@ -382,6 +445,9 @@ const styles = StyleSheet.create({
     top: 0,
     width: SCREEN_WIDTH - CHART_PADDING_LEFT - CHART_PADDING_RIGHT,
     height: CHART_HEIGHT,
+  },
+  gestureContainer: {
+    flex: 1,
   },
   svgContainer: {
     flex: 1,
@@ -438,25 +504,38 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.background.secondary,
     borderRadius: 8,
     padding: 4,
+    shadowColor: Colors.shadow,
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+    elevation: 5,
   },
   zoomButton: {
-    width: 28,
-    height: 28,
-    borderRadius: 4,
+    width: 32,
+    height: 32,
+    borderRadius: 6,
     backgroundColor: Colors.button.secondary,
     justifyContent: "center",
     alignItems: "center",
+    marginHorizontal: 2,
   },
   zoomButtonText: {
     color: Colors.text.primary,
-    fontSize: 16,
+    fontSize: 18,
     fontWeight: "bold" as const,
   },
-  zoomText: {
+  resetButton: {
+    paddingHorizontal: 12,
+    height: 32,
+    borderRadius: 6,
+    backgroundColor: Colors.button.primary,
+    justifyContent: "center",
+    alignItems: "center",
+    marginHorizontal: 4,
+  },
+  resetButtonText: {
     color: Colors.text.primary,
     fontSize: 12,
-    marginHorizontal: 8,
-    minWidth: 30,
-    textAlign: "center",
+    fontWeight: "600" as const,
   },
 });
